@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>مترجم الكوردية والإنكليزية</title>
+<meta name="referrer" content="no-referrer">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Kufi+Arabic:wght@700;800&family=Noto+Sans+Arabic:wght@400;500;600&family=Vazirmatn:wght@400;500;600;700&display=swap">
@@ -395,7 +396,7 @@ footer{color:var(--muted);font-size:.8125rem;text-align:center}
     engineReady = Promise.resolve();
     $('tierBox').hidden = true;
     $('ocrNote').hidden = false;
-    $('footNote').textContent = 'مجاني وبدون مفتاح: يترجم عبر خدمة Google Translate العامة، ويقرأ النص من الصور داخل متصفحك، والقراءة الصوتية من أصوات جهازك. يحتاج اتصالاً بالإنترنت.';
+    $('footNote').textContent = 'مجاني وبدون مفتاح: يترجم عبر خدمة Google Translate العامة، ويقرأ النص من الصور داخل متصفحك، والقراءة الصوتية من أصوات جهازك أو صوت Google المجاني. يحتاج اتصالاً بالإنترنت.';
   }
 
   /* ---------- Claude engine ---------- */
@@ -631,19 +632,41 @@ footer{color:var(--muted);font-size:.8125rem;text-align:center}
     return { lang: r.lang, original: original, trans: r.text.trim() };
   }
 
-  /* ================= text to speech (the device's own voices) ================= */
+  /* ================= text to speech =================
+     Tries, in order: a matching voice installed on the device, then Google Translate's free
+     online voice (only outside Claude, where the page may play audio from other sites), then
+     the closest stand-in. Kurdish voices are rare, so Sorani can fall back to a Persian or
+     Arabic voice and Kurmanji to a Turkish one, and the page says so. */
   var tts = ('speechSynthesis' in window && typeof window.SpeechSynthesisUtterance === 'function') ? window.speechSynthesis : null;
-  var speaking = false, speakToken = 0;
-  // Voice preference per language; voices after the "exact" ones are approximate stand-ins.
-  var VOICES = {
-    ar:  { prefs: ['ar'], exact: 1, fallbackTag: 'ar-SA' },
-    ckb: { prefs: ['ckb', 'ku', 'fa', 'ar'], exact: 2, approx: { fa: 'فارسي', ar: 'عربي' } },
-    kmr: { prefs: ['kmr', 'ku', 'tr'], exact: 2, approx: { tr: 'تركي' } },
-    en:  { prefs: ['en'], exact: 1, fallbackTag: 'en-US' }
+  var online = !inClaude;
+  var canSpeak = !!tts || online;
+  var speaking = false, speakToken = 0, audioEl = null, audioDone = null;
+  var GTTS = 'https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob';
+
+  var SPEAK_PLANS = {
+    ar:  [{ dev: ['ar'] }, { net: 'ar' }],
+    en:  [{ dev: ['en'] }, { net: 'en' }],
+    ckb: [{ dev: ['ckb', 'ku'] }, { net: 'ckb' },
+          { net: 'fa', map: 'fa', note: 'فارسي' }, { dev: ['fa'], map: 'fa', note: 'فارسي' },
+          { net: 'ar', map: 'ar', note: 'عربي' }, { dev: ['ar'], map: 'ar', note: 'عربي' }],
+    kmr: [{ dev: ['kmr', 'ku'] }, { net: 'ku' },
+          { net: 'tr', map: 'tr', note: 'تركي' }, { dev: ['tr'], map: 'tr', note: 'تركي' }]
   };
+
+  // Letters a Persian, Arabic or Turkish voice can't read, swapped for the nearest sound.
+  function adaptText(map, t) {
+    if (map === 'fa' || map === 'ar') {
+      t = t.replace(/ڕ/g, 'ر').replace(/ڵ/g, 'ل').replace(/ۆ/g, 'و').replace(/ێ/g, 'ی').replace(/[ەھ]/g, 'ه').replace(/ڤ/g, 'و');
+      if (map === 'ar') t = t.replace(/ی/g, 'ي').replace(/ک/g, 'ك').replace(/گ/g, 'ك').replace(/پ/g, 'ب').replace(/چ/g, 'تش').replace(/ژ/g, 'ج');
+    } else if (map === 'tr') {
+      t = t.replace(/i/g, 'ı').replace(/î/g, 'i').replace(/Î/g, 'İ').replace(/ê/g, 'e').replace(/Ê/g, 'E').replace(/û/g, 'u').replace(/Û/g, 'U').replace(/x/g, 'h').replace(/X/g, 'H').replace(/q/g, 'k').replace(/Q/g, 'K');
+    }
+    return t;
+  }
 
   function loadVoices() {
     return new Promise(function (res) {
+      if (!tts) return res([]);
       var v = tts.getVoices();
       if (v && v.length) return res(v);
       var finished = false;
@@ -653,15 +676,11 @@ footer{color:var(--muted);font-size:.8125rem;text-align:center}
     });
   }
 
-  function pickVoice(voices, lang) {
-    var cfg = VOICES[lang];
-    for (var i = 0; i < cfg.prefs.length; i++) {
-      var p = cfg.prefs[i];
+  function findVoice(voices, prefs) {
+    for (var i = 0; i < prefs.length; i++) {
+      var p = prefs[i];
       var m = voices.filter(function (v) { return String(v.lang || '').toLowerCase().replace('_', '-').split('-')[0] === p; });
-      if (m.length) {
-        var best = m.filter(function (v) { return /-iq$/i.test(v.lang); })[0] || m.filter(function (v) { return v.localService; })[0] || m[0];
-        return { voice: best, exact: i < cfg.exact, code: p };
-      }
+      if (m.length) return m.filter(function (v) { return /-iq$/i.test(v.lang); })[0] || m.filter(function (v) { return v.localService; })[0] || m[0];
     }
     return null;
   }
@@ -669,9 +688,10 @@ footer{color:var(--muted);font-size:.8125rem;text-align:center}
   function speechParts(t) {
     var parts = [];
     t.split(/\n+/).forEach(function (line) {
-      var s = line.match(/[^.!?؟!،,;؛]+[.!?؟!،,;؛]*\s*/g) || [line];
+      var s = line.match(/[^.!?؟،,;؛]+[.!?؟،,;؛]*\s*/g) || [line];
       var cur = '';
       s.forEach(function (x) {
+        while (x.length > 180) { var cut = x.lastIndexOf(' ', 180); cut = cut > 60 ? cut : 180; if (cur) { parts.push(cur); cur = ''; } parts.push(x.slice(0, cut)); x = x.slice(cut); }
         if ((cur + x).length > 180 && cur) { parts.push(cur); cur = x; } else cur += x;
       });
       if (cur.trim()) parts.push(cur);
@@ -688,47 +708,106 @@ footer{color:var(--muted);font-size:.8125rem;text-align:center}
   }
 
   function stopSpeech() {
-    if (!tts) return;
     speakToken++;
-    try { tts.cancel(); } catch (e) {}
+    if (audioDone) { var f = audioDone; audioDone = null; f(); }
+    if (audioEl) { try { audioEl.pause(); audioEl.removeAttribute('src'); } catch (e) {} audioEl = null; }
+    if (tts) { try { tts.cancel(); } catch (e) {} }
     if (speaking) setSpeaking(false);
   }
 
+  // Resolves true when every part was spoken (or speech was stopped), false on an error.
+  function playDevice(parts, voice) {
+    return new Promise(function (resolve) {
+      try { tts.cancel(); } catch (e) {}
+      var settled = false;
+      var fin = function (ok) { if (settled) return; settled = true; if (!ok) { try { tts.cancel(); } catch (e) {} } resolve(ok); };
+      parts.forEach(function (t, i) {
+        var u = new SpeechSynthesisUtterance(t);
+        u.voice = voice; u.lang = voice.lang; u.rate = 0.95;
+        if (i === parts.length - 1) u.onend = function () { fin(true); };
+        u.onerror = function (ev) {
+          var e = ev && ev.error;
+          fin(e === 'interrupted' || e === 'canceled');
+        };
+        tts.speak(u);
+      });
+    });
+  }
+
+  // Resolves 'done', 'unsupported' (the first part would not load), 'failed' (cut off later) or 'blocked'.
+  function playOnline(parts, tl, token) {
+    return new Promise(function (resolve) {
+      var a = new Audio(), i = 0, settled = false;
+      audioEl = a;
+      var fin = function (r) { if (settled) return; settled = true; a.onended = a.onerror = null; if (audioDone === stopper) audioDone = null; resolve(r); };
+      var stopper = function () { fin('done'); };
+      audioDone = stopper;
+      var next = function () {
+        if (token !== speakToken || i >= parts.length) return fin('done');
+        a.src = GTTS + '&tl=' + encodeURIComponent(tl) + '&total=' + parts.length + '&idx=' + i + '&textlen=' + parts[i].length + '&q=' + encodeURIComponent(parts[i]);
+        var pr = a.play();
+        if (pr && pr.catch) pr.catch(function (err) {
+          var n = err && err.name;
+          if (n === 'NotAllowedError') fin('blocked');
+          else if (n !== 'AbortError') fin(i === 0 ? 'unsupported' : 'failed');
+        });
+      };
+      a.onended = function () { i++; next(); };
+      a.onerror = function () { fin(i === 0 ? 'unsupported' : 'failed'); };
+      next();
+    });
+  }
+
+  function noVoiceMsg(lang) {
+    if (lang === 'ckb' || lang === 'kmr') {
+      return online
+        ? 'تعذّرت القراءة الصوتية: لا يوجد صوت كوردي على جهازك، والصوت عبر الإنترنت ما اشتغل. تحقّق من الاتصال وحاول مجدداً.'
+        : 'لا يوجد صوت كوردي ولا صوت بديل على جهازك. افتح ملف الموقع في المتصفح ليستخدم الصوت عبر الإنترنت.';
+    }
+    var name = lang === 'en' ? 'الإنكليزية' : 'العربية';
+    return online
+      ? 'تعذّرت القراءة الصوتية. تحقّق من الإنترنت، أو ثبّت صوت ' + name + ' من إعدادات الكلام في جهازك.'
+      : 'لا يوجد صوت ' + name + ' على جهازك. ثبّته من إعدادات الكلام في جهازك، أو افتح ملف الموقع في المتصفح.';
+  }
+
   async function speak() {
-    if (!tts) return;
+    if (!canSpeak) return;
     if (speaking) { stopSpeech(); return; }
     var text = $('outText').textContent.trim();
     if (!text) return;
-    var lang = outLang;
+    var lang = SPEAK_PLANS[outLang] ? outLang : 'ar';
     var token = ++speakToken;
     setSpeaking(true);
     var voices = await loadVoices();
     if (token !== speakToken) return;
-    var pick = pickVoice(voices, lang);
-    var cfg = VOICES[lang];
-    if (!pick && !cfg.fallbackTag) {
-      setSpeaking(false);
-      showStatus('لا يوجد صوت كوردي ولا صوت بديل على جهازك، فلا يمكن قراءة هذه الترجمة بصوت.', 'warn');
-      return;
-    }
-    if (pick && !pick.exact) showStatus('لا يوجد صوت كوردي على جهازك، فالقراءة بصوت ' + cfg.approx[pick.code] + ' تقريبي.', 'info');
-    var parts = speechParts(text);
-    try { tts.cancel(); } catch (e) {}
-    parts.forEach(function (t, i) {
-      var u = new SpeechSynthesisUtterance(t);
-      if (pick) { u.voice = pick.voice; u.lang = pick.voice.lang; } else { u.lang = cfg.fallbackTag; }
-      u.rate = 0.95;
-      if (i === parts.length - 1) u.onend = function () { if (token === speakToken) setSpeaking(false); };
-      u.onerror = function (ev) {
+    var plan = SPEAK_PLANS[lang];
+    for (var i = 0; i < plan.length; i++) {
+      var step = plan[i];
+      var parts = speechParts(step.map ? adaptText(step.map, text) : text);
+      if (!parts.length) break;
+      var note = step.note ? 'ما لقينا صوت كوردي، فالقراءة بصوت ' + step.note + ' تقريبي.' : '';
+      if (step.dev) {
+        if (!tts) continue;
+        var v = findVoice(voices, step.dev);
+        if (!v) continue;
+        if (note) showStatus(note, 'info');
+        var ok = await playDevice(parts, v);
         if (token !== speakToken) return;
-        var err = ev && ev.error;
-        if (err === 'interrupted' || err === 'canceled') return;
-        speakToken++; try { tts.cancel(); } catch (e) {}
-        setSpeaking(false);
-        showStatus('تعذّر تشغيل الصوت على هذا الجهاز أو المتصفح.', 'error');
-      };
-      tts.speak(u);
-    });
+        if (ok) { setSpeaking(false); return; }
+        if (note) showStatus('');
+        continue;
+      }
+      if (!online) continue;
+      if (note) showStatus(note, 'info');
+      var r = await playOnline(parts, step.net, token);
+      if (token !== speakToken) return;
+      if (r === 'done') { setSpeaking(false); return; }
+      if (r === 'blocked') { setSpeaking(false); showStatus('المتصفح منع تشغيل الصوت. اضغط «استمع» مرة ثانية.', 'warn'); return; }
+      if (r === 'failed') { setSpeaking(false); showStatus('انقطع الصوت. تحقّق من الإنترنت وحاول مجدداً.', 'error'); return; }
+      if (note) showStatus('');
+    }
+    setSpeaking(false);
+    showStatus(noVoiceMsg(lang), 'warn');
   }
 
   /* ================= voice input (the browser's own speech recognition) ================= */
@@ -866,7 +945,7 @@ footer{color:var(--muted);font-size:.8125rem;text-align:center}
     if (isImg && p.original) { $('origText').textContent = p.original; ob.hidden = false; if (waiting) ob.open = true; }
     else { ob.hidden = true; }
     $('copyBtn').disabled = !has || streaming;
-    $('listenBtn').disabled = !tts || !has || streaming;
+    $('listenBtn').disabled = !canSpeak || !has || streaming;
   }
 
   function clearOutput() { stopSpeech(); setOutput({ lang: null, original: '', trans: '' }, false, false); }
@@ -1089,7 +1168,7 @@ footer{color:var(--muted);font-size:.8125rem;text-align:center}
         if (p.lang && TGT[p.lang]) lastDetected = p.lang;
         if (p.truncated) showStatus('النص طويل فانقطعت الترجمة. قسّمه إلى أجزاء أصغر.', 'warn');
         if (p.trans) addHistory({ mode: isImg ? 'image' : (isVoice ? 'voice' : 'text'), lang: p.lang, tgt: jobTgt, src: isImg ? p.original : text, out: p.trans });
-        if (isVoice && p.trans && voiceOk && $('autoSpeak').checked && tts) setTimeout(speak, 0);
+        if (isVoice && p.trans && voiceOk && $('autoSpeak').checked && canSpeak) setTimeout(speak, 0);
       }
     } catch (e) {
       var code = (e && e.code) || 'upstream_error';
@@ -1188,7 +1267,7 @@ footer{color:var(--muted);font-size:.8125rem;text-align:center}
   $('goBtn').addEventListener('click', translate);
   $('stopBtn').addEventListener('click', function () { rerunAfterStop = false; if (ctl) ctl.abort(); });
   $('listenBtn').addEventListener('click', speak);
-  if (!tts) $('listenBtn').title = 'القراءة الصوتية غير مدعومة في هذا المتصفح';
+  if (!canSpeak) $('listenBtn').title = 'القراءة الصوتية غير مدعومة في هذا المتصفح';
 
   $('editOrig').addEventListener('click', function () {
     var t = $('origText').textContent;
